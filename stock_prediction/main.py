@@ -44,6 +44,7 @@ from stock_prediction.backtesting import (
     plot_equity_curve,
 )
 from stock_prediction.rl_agent import train_dqn_agent
+from stock_prediction.live_signal import generate_live_signal
 
 
 # ---------------------------------------------------------------------------
@@ -138,13 +139,30 @@ def parse_args():
         metavar="TICKER",
         help=f"Stock ticker(s) to analyse (default: {TICKERS})",
     )
+    parser.add_argument(
+        "--signal",
+        action="store_true",
+        help="Instead of running the full backtest pipeline, print a live "
+             "BUY/HOLD signal for today based on the latest available data.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    all_results = {}
 
+    if args.signal:
+        # Live signal mode — train on full history and predict today
+        for ticker in args.ticker:
+            try:
+                generate_live_signal(ticker.upper())
+            except Exception as e:
+                print(f"\n[ERROR] Failed for {ticker}: {e}")
+                import traceback; traceback.print_exc()
+        return
+
+    # Default: full historical backtest pipeline
+    all_results = {}
     for ticker in args.ticker:
         try:
             all_results[ticker] = run_pipeline(ticker.upper())
