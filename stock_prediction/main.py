@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stock_prediction.data_collection import download_stock_data, TICKERS
 from stock_prediction.features import build_features, get_feature_columns
-from stock_prediction.models import chronological_split, train_all_models
+from stock_prediction.models import chronological_split, train_all_models, MajorityVoteEnsemble
 from stock_prediction.evaluation import (
     evaluate_model,
     plot_confusion_matrix,
@@ -86,6 +86,14 @@ def run_pipeline(ticker: str):
         daily_returns_train=train_slice_returns,
     )
     models["DQN (RL Agent)"] = dqn_agent
+
+    # 4c. Build ensemble from the three non-baseline models
+    ensemble = MajorityVoteEnsemble([
+        models["Logistic Regression"],
+        models["Random Forest"],
+        models["DQN (RL Agent)"],
+    ])
+    models["Ensemble (LR + RF + DQN)"] = ensemble
 
     # 5. Evaluate on test set
     print("\n[5/6] Evaluating on test set...")

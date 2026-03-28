@@ -120,6 +120,33 @@ def chronological_split(
 
 
 # ---------------------------------------------------------------------------
+# Majority-vote ensemble
+# ---------------------------------------------------------------------------
+
+class MajorityVoteEnsemble:
+    """
+    Combines predictions from multiple models via majority vote.
+
+    Each model gets one vote (0 or 1) per day. If at least half the models
+    vote UP, the ensemble predicts UP. Ties go to UP (conservative for a
+    long-only strategy).
+
+    Exposes a sklearn-compatible .predict() interface so it can be passed
+    directly to evaluate_model(), plot_confusion_matrix(), and run_backtest()
+    without any changes to those functions.
+    """
+
+    def __init__(self, models: list):
+        self.models = models
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        # stack each model's predictions as rows — shape (n_models, n_days)
+        votes = np.stack([m.predict(X) for m in self.models])
+        # majority: predict 1 if at least half the models voted 1
+        return (votes.sum(axis=0) >= len(self.models) / 2).astype(int)
+
+
+# ---------------------------------------------------------------------------
 # Train all models on training data
 # ---------------------------------------------------------------------------
 
