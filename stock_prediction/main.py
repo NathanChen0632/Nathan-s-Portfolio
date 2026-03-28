@@ -14,10 +14,10 @@ Workflow
   1. Download historical OHLCV data (yfinance)
   2. Engineer technical features
   3. Chronological train / val / test split (70 / 15 / 15)
-  4. Train Baseline, Logistic Regression, and Random Forest
+  4. Train Baseline, Logistic Regression, Random Forest, and DQN RL agent
   5. Evaluate on validation set (hyperparameter awareness) and test set
   6. Plot confusion matrices, feature importance, LR coefficients
-  7. Run backtesting simulation vs buy-and-hold
+  7. Run backtesting simulation vs buy-and-hold for all models
 """
 
 import argparse
@@ -43,6 +43,7 @@ from stock_prediction.backtesting import (
     print_backtest_metrics,
     plot_equity_curve,
 )
+from stock_prediction.rl_agent import train_dqn_agent
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +70,25 @@ def run_pipeline(ticker: str):
     splits = chronological_split(feat_df, feature_cols)
     print(f"  Train: {len(splits['X_train'])}  Val: {len(splits['X_val'])}  Test: {len(splits['X_test'])}")
 
-    # 4. Train models
-    print("\n[4/5] Training models...")
+    # 4. Train supervised models
+    print("\n[4/6] Training supervised models...")
     models = train_all_models(splits["X_train"], splits["y_train"])
 
+    # 4b. Train RL agent
+    # Pull daily_return from the training slice of feat_df so the environment
+    # can compute portfolio rewards (action * daily_return - tx_cost).
+    print("\n[4b/6] Training RL (DQN) agent...")
+    n_train = len(splits["X_train"])
+    train_slice_returns = feat_df["daily_return"].values[:n_train]
+
+    dqn_agent = train_dqn_agent(
+        X_train=splits["X_train"],
+        daily_returns_train=train_slice_returns,
+    )
+    models["DQN (RL Agent)"] = dqn_agent
+
     # 5. Evaluate on test set
-    print("\n[5/5] Evaluating on test set...")
+    print("\n[5/6] Evaluating on test set...")
     test_results = {}
     for name, model in models.items():
         test_results[name] = evaluate_model(name, model, splits["X_test"], splits["y_test"])
@@ -89,7 +103,7 @@ def run_pipeline(ticker: str):
         plot_lr_coefficients(models["Logistic Regression"], feature_cols)
 
     # 6. Backtesting
-    print(f"\n[Backtesting] Running trading simulations on test set...")
+    print(f"\n[6/6] Running trading simulations on test set...")
     for name, model in models.items():
         if name == "Baseline (Majority Class)":
             continue  # baseline equity curve not informative
