@@ -45,6 +45,7 @@ from stock_prediction.backtesting import (
 )
 from stock_prediction.rl_agent import train_dqn_agent
 from stock_prediction.live_signal import generate_live_signal
+from stock_prediction.monitor import run_monitor
 
 
 # ---------------------------------------------------------------------------
@@ -145,14 +146,41 @@ def parse_args():
         help="Instead of running the full backtest pipeline, print a live "
              "BUY/HOLD signal for today based on the latest available data.",
     )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Continuously poll for live data and print updated signals "
+             "every --interval minutes during market hours.",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=5,
+        metavar="MINUTES",
+        help="Polling interval in minutes when using --monitor (default: 5)",
+    )
+    parser.add_argument(
+        "--no-market-check",
+        action="store_true",
+        help="Disable market-hours gating for --monitor (useful for testing)",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
+    if args.monitor:
+        # Continuous monitoring mode — trains once, polls every N minutes
+        run_monitor(
+            tickers=[t.upper() for t in args.ticker],
+            interval_minutes=args.interval,
+            skip_market_check=args.no_market_check,
+        )
+        return
+
     if args.signal:
-        # Live signal mode — train on full history and predict today
+        # One-shot live signal — train on full history and predict today
         for ticker in args.ticker:
             try:
                 generate_live_signal(ticker.upper())
