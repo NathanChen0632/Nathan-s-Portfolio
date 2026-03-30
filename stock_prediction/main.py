@@ -164,6 +164,12 @@ def parse_args():
         action="store_true",
         help="Disable market-hours gating for --monitor (useful for testing)",
     )
+    parser.add_argument(
+        "--email",
+        action="store_true",
+        help="Send email alerts on BUY/SELL signals (requires SMTP_USER, "
+             "SMTP_PASSWORD, ALERT_TO env vars).",
+    )
     return parser.parse_args()
 
 
@@ -176,6 +182,7 @@ def main():
             tickers=[t.upper() for t in args.ticker],
             interval_minutes=args.interval,
             skip_market_check=args.no_market_check,
+            email_alerts=args.email,
         )
         return
 

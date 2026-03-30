@@ -27,10 +27,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import smtplib
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from enum import Enum
 
 import numpy as np
@@ -113,6 +116,140 @@ YELLOW = "\033[93m"
 GREY   = "\033[90m"
 BOLD   = "\033[1m"
 RESET  = "\033[0m"
+
+
+# ---------------------------------------------------------------------------
+# Email alerts
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EmailConfig:
+    """
+    Email credentials loaded from environment variables.
+
+    Required env vars:
+      SMTP_USER      — your Gmail address  (e.g. you@gmail.com)
+      SMTP_PASSWORD  — Gmail App Password  (16-char, no spaces)
+                       Generate at: Google Account → Security → App passwords
+      ALERT_TO       — recipient address   (can be same as SMTP_USER)
+
+    Optional:
+      SMTP_HOST      — default: smtp.gmail.com
+      SMTP_PORT      — default: 587
+    """
+    sender:   str
+    password: str
+    to:       str
+    host:     str = "smtp.gmail.com"
+    port:     int = 587
+
+    @classmethod
+    def from_env(cls) -> "EmailConfig | None":
+        """
+        Build an EmailConfig from environment variables.
+        Returns None (with a warning) if any required variable is missing.
+        """
+        sender   = os.environ.get("SMTP_USER")
+        password = os.environ.get("SMTP_PASSWORD")
+        to       = os.environ.get("ALERT_TO")
+
+        if not all([sender, password, to]):
+            missing = [v for v, val in [
+                ("SMTP_USER", sender), ("SMTP_PASSWORD", password), ("ALERT_TO", to)
+            ] if not val]
+            print(f"{YELLOW}[EMAIL] Missing env vars: {', '.join(missing)} — alerts disabled.{RESET}")
+            print(f"{YELLOW}[EMAIL] Set them in a .env file or export before running.{RESET}")
+            return None
+
+        return cls(
+            sender=sender,
+            password=password,
+            to=to,
+            host=os.environ.get("SMTP_HOST", "smtp.gmail.com"),
+            port=int(os.environ.get("SMTP_PORT", 587)),
+        )
+
+
+def _build_email_body(
+    action:      str,
+    ticker:      str,
+    price:       float,
+    state:       "StrategyState",
+    votes:       dict[str, int],
+) -> tuple[str, str]:
+    """Return (subject, html_body) for a BUY or SELL alert."""
+    ts       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    emoji    = "🟢" if action == "BUY" else "🔴"
+    subject  = f"{emoji} {action} {ticker} @ ${price:.2f} — Trading Alert"
+
+    if action == "BUY":
+        action_line = f"<b style='color:green'>BUY {ticker} NOW @ ${price:.2f}</b>"
+        detail_line = f"New position opened. Watching for SELL signal."
+    else:
+        pnl      = (price - state.entry_price) / state.entry_price * 100
+        sign     = "+" if pnl >= 0 else ""
+        colour   = "green" if pnl >= 0 else "red"
+        action_line = f"<b style='color:red'>SELL {ticker} NOW @ ${price:.2f}</b>"
+        detail_line = (
+            f"Entry: ${state.entry_price:.2f} &nbsp;|&nbsp; "
+            f"P&amp;L: <b style='color:{colour}'>{sign}{pnl:.2f}%</b>"
+        )
+
+    vote_rows = "".join(
+        f"<tr><td>{name}</td>"
+        f"<td style='color:{'green' if v == 1 else 'red'}'>"
+        f"{'▲ UP' if v == 1 else '▼ DOWN'}</td></tr>"
+        for name, v in votes.items()
+    )
+
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;max-width:480px">
+      <h2>{emoji} Trading Signal — {ticker}</h2>
+      <p style="font-size:1.3em">{action_line}</p>
+      <p>{detail_line}</p>
+      <p style="color:#888">Time: {ts}</p>
+      <hr/>
+      <h3>Model Breakdown</h3>
+      <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">
+        <tr><th>Model</th><th>Prediction</th></tr>
+        {vote_rows}
+      </table>
+      <hr/>
+      <p style="color:#aaa;font-size:0.8em">
+        This is a research tool, not financial advice.
+      </p>
+    </body></html>
+    """
+    return subject, html
+
+
+def send_email_alert(
+    cfg:    "EmailConfig",
+    action: str,
+    ticker: str,
+    price:  float,
+    state:  "StrategyState",
+    votes:  dict[str, int],
+) -> None:
+    """Send a BUY or SELL alert email. Silently logs on failure."""
+    try:
+        subject, html = _build_email_body(action, ticker, price, state, votes)
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = cfg.sender
+        msg["To"]      = cfg.to
+        msg.attach(MIMEText(html, "html"))
+
+        with smtplib.SMTP(cfg.host, cfg.port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(cfg.sender, cfg.password)
+            server.sendmail(cfg.sender, cfg.to, msg.as_string())
+
+        print(f"  {GREEN}[EMAIL] Alert sent to {cfg.to}{RESET}")
+    except Exception as e:
+        print(f"  {YELLOW}[EMAIL] Failed to send alert: {e}{RESET}")
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +482,7 @@ def poll_once(
     history_df: pd.DataFrame,
     trained:    dict,
     state:      StrategyState,
+    email_cfg:  EmailConfig | None = None,
 ) -> None:
     live_bar = fetch_latest_bar(ticker)
     if live_bar is None:
@@ -356,11 +494,15 @@ def poll_once(
         print(f"  [{ticker}] Feature computation failed.")
         return
 
-    price               = float(live_bar["Close"])
-    consensus, votes    = get_consensus(trained, X_live)
-    action              = resolve_strategy_action(state, consensus, price)
+    price            = float(live_bar["Close"])
+    consensus, votes = get_consensus(trained, X_live)
+    action           = resolve_strategy_action(state, consensus, price)
 
     print_strategy_signal(action, ticker, price, state, votes, consensus)
+
+    # Send email only on actionable signals (not HOLD or WAIT)
+    if email_cfg and action in ("BUY", "SELL"):
+        send_email_alert(email_cfg, action, ticker, price, state, votes)
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +513,11 @@ def run_monitor(
     tickers:           list[str],
     interval_minutes:  int  = 5,
     skip_market_check: bool = False,
+    email_alerts:      bool = False,
 ) -> None:
+
+    # Load email config from env vars if alerts are requested
+    email_cfg = EmailConfig.from_env() if email_alerts else None
 
     print("\n" + "="*60)
     print(f"  {BOLD}TRADING STRATEGY MONITOR{RESET}")
@@ -379,6 +525,8 @@ def run_monitor(
     print(f"  Interval : every {interval_minutes} minute(s)")
     print(f"  Strategy : FLAT → BUY → HOLD → SELL → FLAT")
     print(f"  Market   : {'always run' if skip_market_check else 'NYSE/NASDAQ hours only'}")
+    email_status = f"{GREEN}enabled → {email_cfg.to}{RESET}" if email_cfg else f"{GREY}disabled{RESET}"
+    print(f"  Email    : {email_status}")
     print("  Press Ctrl-C to stop.")
     print("="*60 + "\n")
 
@@ -420,7 +568,7 @@ def run_monitor(
 
             for ticker in trained:
                 try:
-                    poll_once(ticker, history[ticker], trained[ticker], states[ticker])
+                    poll_once(ticker, history[ticker], trained[ticker], states[ticker], email_cfg)
                 except Exception as e:
                     print(f"  [{ticker}] Poll error: {e}")
 
@@ -456,6 +604,12 @@ def parse_args():
     parser.add_argument("--ticker", nargs="+", default=TICKERS, metavar="TICKER")
     parser.add_argument("--interval", type=int, default=5, metavar="MINUTES")
     parser.add_argument("--no-market-check", action="store_true")
+    parser.add_argument(
+        "--email",
+        action="store_true",
+        help="Send email alerts on BUY/SELL signals. "
+             "Requires SMTP_USER, SMTP_PASSWORD, and ALERT_TO env vars.",
+    )
     return parser.parse_args()
 
 
@@ -465,6 +619,7 @@ def main():
         tickers=[t.upper() for t in args.ticker],
         interval_minutes=args.interval,
         skip_market_check=args.no_market_check,
+        email_alerts=args.email,
     )
 
 
