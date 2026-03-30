@@ -1,35 +1,26 @@
 """
 monitor.py
 ----------
-Continuous live monitoring loop.  Models are trained ONCE at startup on
-full daily history.  Every poll interval the latest intraday bar is fetched,
-features are recomputed on the most recent window, and an updated BUY / HOLD
-signal is printed for every watched ticker.
+Continuous live trading strategy monitor.
 
-How intraday data is used
--------------------------
-  yfinance returns 1-minute bars for the current trading day.
-  We take the most recent minute bar and treat it as the "current bar":
-    Open  = bar open
-    High  = bar high  (best so far this minute)
-    Low   = bar low
-    Close = bar close (latest price)
-    Volume= bar volume
+Strategy state machine (per ticker)
+-------------------------------------
+  FLAT  →  consensus says UP   →  emit BUY  →  LONG
+  LONG  →  consensus says UP   →  emit HOLD →  LONG
+  LONG  →  consensus says DOWN →  emit SELL →  FLAT
+  FLAT  →  consensus says DOWN →  emit WAIT →  FLAT
 
-  This bar is appended to the last N days of daily history so that all
-  rolling-window features (MA50 needs 50 bars, etc.) can be computed
-  without NaN.
+There is ONE strategy signal per ticker per poll.  The individual model
+votes (LR, RF, DQN) are shown as supporting evidence but the user only
+needs to act on the strategy signal at the top.
 
 Usage
 -----
-  python -m stock_prediction.monitor                        # default tickers, 5-min interval
-  python -m stock_prediction.monitor --ticker AAPL MSFT     # specific tickers
-  python -m stock_prediction.monitor --interval 1           # poll every 1 minute
-  python -m stock_prediction.monitor --no-market-check      # run outside market hours (testing)
-
-  OR via main.py:
   python stock_prediction/main.py --monitor
-  python stock_prediction/main.py --monitor --interval 1 --ticker AAPL
+  python stock_prediction/main.py --monitor --ticker AAPL MSFT --interval 1
+  python stock_prediction/main.py --monitor --no-market-check   # test outside hours
+
+  python -m stock_prediction.monitor --ticker AAPL
 """
 
 from __future__ import annotations
@@ -38,7 +29,9 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
+from enum import Enum
 
 import numpy as np
 import pandas as pd
@@ -59,7 +52,7 @@ from stock_prediction.rl_agent import train_dqn_agent
 
 
 # ---------------------------------------------------------------------------
-# Market hours (NYSE / NASDAQ)
+# Market hours
 # ---------------------------------------------------------------------------
 
 MARKET_TZ    = pytz.timezone("America/New_York")
@@ -68,23 +61,20 @@ MARKET_CLOSE = dtime(16, 0)
 
 
 def is_market_open() -> bool:
-    """Return True if the US equity market is currently open."""
     now_et = datetime.now(MARKET_TZ)
-    if now_et.weekday() >= 5:          # Saturday or Sunday
+    if now_et.weekday() >= 5:
         return False
     t = now_et.time()
     return MARKET_OPEN <= t <= MARKET_CLOSE
 
 
 def seconds_until_open() -> float:
-    """Return seconds until the next market open (9:30 ET)."""
-    now_et = datetime.now(MARKET_TZ)
+    now_et     = datetime.now(MARKET_TZ)
     today_open = MARKET_TZ.localize(
         datetime(now_et.year, now_et.month, now_et.day, 9, 30)
     )
     if now_et < today_open and now_et.weekday() < 5:
         return (today_open - now_et).total_seconds()
-    # next weekday open
     days_ahead = 1
     while True:
         candidate = today_open + pd.Timedelta(days=days_ahead)
@@ -94,15 +84,43 @@ def seconds_until_open() -> float:
 
 
 # ---------------------------------------------------------------------------
-# Latest bar fetch
+# Strategy state
+# ---------------------------------------------------------------------------
+
+class Position(Enum):
+    FLAT = "FLAT"   # not holding — looking to buy
+    LONG = "LONG"   # holding     — looking to sell
+
+
+@dataclass
+class StrategyState:
+    """Tracks the live trading state for one ticker."""
+    ticker:      str
+    position:    Position = Position.FLAT
+    entry_price: float    = 0.0
+    entry_time:  str      = ""
+    trade_log:   list     = field(default_factory=list)   # history of completed trades
+
+
+# ---------------------------------------------------------------------------
+# Terminal colours
+# ---------------------------------------------------------------------------
+
+GREEN  = "\033[92m"
+BLUE   = "\033[94m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+GREY   = "\033[90m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+
+# ---------------------------------------------------------------------------
+# Data helpers
 # ---------------------------------------------------------------------------
 
 def fetch_latest_bar(ticker: str) -> pd.Series | None:
-    """
-    Download 1-minute bars for today and return the most recent complete
-    minute bar as a Series with columns Open/High/Low/Close/Volume.
-    Returns None if no intraday data is available yet.
-    """
+    """Fetch the most recent 1-minute bar for the current trading session."""
     try:
         raw = yf.download(
             ticker,
@@ -113,34 +131,23 @@ def fetch_latest_bar(ticker: str) -> pd.Series | None:
         )
         if raw.empty:
             return None
-
-        # Flatten MultiIndex if present
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
-
-        bar = raw[["Open", "High", "Low", "Close", "Volume"]].iloc[-1]
-        return bar
+        return raw[["Open", "High", "Low", "Close", "Volume"]].iloc[-1]
     except Exception as e:
         print(f"  [WARN] Could not fetch intraday bar for {ticker}: {e}")
         return None
 
-
-# ---------------------------------------------------------------------------
-# Feature computation on live data
-# ---------------------------------------------------------------------------
 
 def build_live_feature_row(
     history_df: pd.DataFrame,
     live_bar: pd.Series,
 ) -> tuple[np.ndarray, list[str]] | tuple[None, None]:
     """
-    Append the live bar to historical daily data, recompute features on the
-    extended dataset, and return the feature vector for the latest row.
-
-    Returns (feature_vector, feature_cols) or (None, None) on failure.
+    Append the live bar to daily history and return the feature vector
+    for that bar so all rolling-window indicators are correctly computed.
     """
-    # Build a one-row DataFrame for the live bar with a timestamp index
-    now_ts = pd.Timestamp.now().normalize()           # today at midnight
+    now_ts   = pd.Timestamp.now().normalize()
     live_row = pd.DataFrame(
         {
             "Open":   [float(live_bar["Open"])],
@@ -152,122 +159,193 @@ def build_live_feature_row(
         index=[now_ts],
     )
 
-    # Remove today from history if it exists, then append the live bar
     combined = history_df.copy()
     if now_ts in combined.index:
         combined = combined.drop(index=now_ts)
-    combined = pd.concat([combined, live_row])
-    combined.sort_index(inplace=True)
+    combined = pd.concat([combined, live_row]).sort_index()
 
     try:
-        # build_features drops NaN rows + the last row (no next-day label)
-        # We want the features *including* the live bar, so we temporarily
-        # suppress the last-row drop by adding a dummy future row.
+        # Add a dummy next-day row so build_features doesn't drop the live bar
         dummy_ts  = now_ts + pd.Timedelta(days=1)
         dummy_row = pd.DataFrame(
             {col: [combined[col].iloc[-1]] for col in combined.columns},
             index=[dummy_ts],
         )
-        extended = pd.concat([combined, dummy_row])
-
-        feat_df      = build_features(extended)
+        feat_df      = build_features(pd.concat([combined, dummy_row]))
         feature_cols = get_feature_columns(feat_df)
-
-        # The last real row is the live bar's feature vector
-        live_feat = feat_df.iloc[-2][feature_cols].values.reshape(1, -1)
-        return live_feat, feature_cols
+        return feat_df.iloc[-2][feature_cols].values.reshape(1, -1), feature_cols
     except Exception as e:
         print(f"  [WARN] Feature computation failed: {e}")
         return None, None
 
 
 # ---------------------------------------------------------------------------
-# One-time model training
+# Model training (once at startup)
 # ---------------------------------------------------------------------------
 
 def train_models_on_history(ticker: str, history_df: pd.DataFrame) -> dict:
-    """
-    Train all models on the full available daily history.
-    Called once at startup — this is the slow step.
-    """
-    print(f"  [{ticker}] Building features for training...")
+    print(f"  [{ticker}] Building features...")
     feat_df      = build_features(history_df)
     feature_cols = get_feature_columns(feat_df)
-
-    X = feat_df[feature_cols].values
-    y = feat_df["Target"].values
+    X            = feat_df[feature_cols].values
+    y            = feat_df["Target"].values
 
     print(f"  [{ticker}] Training on {len(X)} samples, {len(feature_cols)} features...")
 
-    baseline = MajorityClassBaseline()
-    baseline.fit(X, y)
+    lr  = build_logistic_regression();  lr.fit(X, y)
+    rf  = build_random_forest();        rf.fit(X, y)
+    dqn = train_dqn_agent(X_train=X, daily_returns_train=feat_df["daily_return"].values, n_episodes=15)
 
-    lr = build_logistic_regression()
-    lr.fit(X, y)
-
-    rf = build_random_forest()
-    rf.fit(X, y)
-
-    dqn = train_dqn_agent(
-        X_train=X,
-        daily_returns_train=feat_df["daily_return"].values,
-        n_episodes=15,
-    )
-
-    ensemble = MajorityVoteEnsemble([lr, rf, dqn])
-
-    print(f"  [{ticker}] Training complete.\n")
-
+    print(f"  [{ticker}] Done.\n")
     return {
-        "Baseline":  baseline,
-        "LR":        lr,
-        "RF":        rf,
-        "DQN":       dqn,
-        "Ensemble":  ensemble,
+        "LR":           lr,
+        "RF":           rf,
+        "DQN":          dqn,
+        "Ensemble":     MajorityVoteEnsemble([lr, rf, dqn]),
         "feature_cols": feature_cols,
     }
+
+
+# ---------------------------------------------------------------------------
+# Strategy signal resolution
+# ---------------------------------------------------------------------------
+
+def get_consensus(trained: dict, X_live: np.ndarray) -> tuple[int, dict[str, int]]:
+    """
+    Run all models, compute majority vote (excluding baseline).
+    Returns (consensus: 0|1, individual_votes: dict).
+    """
+    model_map = {
+        "Logistic Reg":  trained["LR"],
+        "Random Forest": trained["RF"],
+        "DQN Agent":     trained["DQN"],
+        "Ensemble":      trained["Ensemble"],
+    }
+    votes = {name: int(m.predict(X_live)[0]) for name, m in model_map.items()}
+
+    # Majority vote across LR + RF + DQN (not Ensemble — it already combines them)
+    core_votes = [votes["Logistic Reg"], votes["Random Forest"], votes["DQN Agent"]]
+    consensus  = 1 if sum(core_votes) >= 2 else 0
+    return consensus, votes
+
+
+def resolve_strategy_action(state: StrategyState, consensus: int, price: float) -> str:
+    """
+    Apply the consensus signal to the current position state and return
+    the action string.  Updates state in place.
+    """
+    if state.position == Position.FLAT:
+        if consensus == 1:
+            # Enter position
+            state.position    = Position.LONG
+            state.entry_price = price
+            state.entry_time  = datetime.now().strftime("%H:%M:%S")
+            return "BUY"
+        else:
+            return "WAIT"
+
+    else:  # Position.LONG
+        if consensus == 0:
+            # Exit position
+            pnl = (price - state.entry_price) / state.entry_price * 100
+            state.trade_log.append({
+                "entry": state.entry_price,
+                "exit":  price,
+                "pnl%":  pnl,
+                "time":  datetime.now().strftime("%H:%M:%S"),
+            })
+            state.position    = Position.FLAT
+            state.entry_price = 0.0
+            state.entry_time  = ""
+            return "SELL"
+        else:
+            return "HOLD"
+
+
+# ---------------------------------------------------------------------------
+# Poll display
+# ---------------------------------------------------------------------------
+
+def print_strategy_signal(
+    action:     str,
+    ticker:     str,
+    price:      float,
+    state:      StrategyState,
+    votes:      dict[str, int],
+    consensus:  int,
+) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+
+    # --- colour and banner by action ---
+    if action == "BUY":
+        colour  = GREEN
+        banner  = f"  {BOLD}{GREEN}>>> BUY {ticker} NOW  @  ${price:.2f} <<<{RESET}"
+        summary = f"  {GREEN}Entering position at ${price:.2f}{RESET}"
+    elif action == "SELL":
+        colour  = RED
+        pnl     = (price - state.entry_price) / state.entry_price * 100
+        sign    = "+" if pnl >= 0 else ""
+        banner  = f"  {BOLD}{RED}>>> SELL {ticker} NOW  @  ${price:.2f} <<<{RESET}"
+        summary = (
+            f"  {RED}Exiting position  |  Entry: ${state.entry_price:.2f}  "
+            f"P&L: {sign}{pnl:.2f}%{RESET}"
+        )
+    elif action == "HOLD":
+        colour  = BLUE
+        pnl     = (price - state.entry_price) / state.entry_price * 100
+        sign    = "+" if pnl >= 0 else ""
+        banner  = f"  {BOLD}{BLUE}HOLD {ticker}  @  ${price:.2f}{RESET}"
+        summary = (
+            f"  {BLUE}Holding since ${state.entry_price:.2f} (entry: {state.entry_time})  "
+            f"Unrealised P&L: {sign}{pnl:.2f}%{RESET}"
+        )
+    else:  # WAIT
+        colour  = GREY
+        banner  = f"  {GREY}WAIT — no position in {ticker}  (${price:.2f}){RESET}"
+        summary = f"  {GREY}Watching for a BUY signal...{RESET}"
+
+    print(f"\n  {'═'*58}")
+    print(f"  [{ts}]  {ticker}  ${price:.2f}")
+    print(f"  {'═'*58}")
+    print(banner)
+    print(summary)
+    print(f"  {'─'*58}")
+
+    # Supporting model votes
+    print(f"  Model breakdown:")
+    for name, vote in votes.items():
+        dot   = f"{GREEN}●{RESET}" if vote == 1 else f"{RED}●{RESET}"
+        label = "UP  " if vote == 1 else "DOWN"
+        print(f"    {dot}  {name:<18}  predicts {label}")
+
+    buy_count = sum(v for k, v in votes.items() if k != "Ensemble")
+    print(f"  {'─'*58}")
+    print(f"  Consensus: {buy_count}/3 core models say UP  →  "
+          f"{colour}{'UP — BUY/HOLD' if consensus == 1 else 'DOWN — SELL/WAIT'}{RESET}")
+
+    # Session trade log
+    if state.trade_log:
+        print(f"  {'─'*58}")
+        print(f"  Session trades:")
+        for t in state.trade_log[-3:]:          # show last 3
+            sign = "+" if t["pnl%"] >= 0 else ""
+            col  = GREEN if t["pnl%"] >= 0 else RED
+            print(f"    {t['time']}  entry ${t['entry']:.2f}  "
+                  f"exit ${t['exit']:.2f}  {col}{sign}{t['pnl%']:.2f}%{RESET}")
+
+    print(f"  {'═'*58}")
 
 
 # ---------------------------------------------------------------------------
 # Single poll
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Action resolution
-# ---------------------------------------------------------------------------
-
-# Position state: 1 = currently holding, 0 = currently in cash
-# Transition table:
-#   prev=0, new=1  → BUY   (enter position)
-#   prev=1, new=1  → HOLD  (stay in)
-#   prev=1, new=0  → SELL  (exit position)
-#   prev=0, new=0  → CASH  (stay out)
-
-ACTION_LABELS = {
-    (0, 1): ("BUY ",  "▲", "\033[92m"),   # green
-    (1, 1): ("HOLD",  "─", "\033[94m"),   # blue
-    (1, 0): ("SELL",  "▼", "\033[91m"),   # red
-    (0, 0): ("CASH",  " ", "\033[90m"),   # grey
-}
-RESET = "\033[0m"
-
-
-def resolve_action(prev: int, new: int) -> tuple[str, str, str]:
-    """Return (label, arrow, colour) for a prev→new position transition."""
-    return ACTION_LABELS[(prev, new)]
-
-
 def poll_once(
-    ticker: str,
+    ticker:     str,
     history_df: pd.DataFrame,
-    trained: dict,
-    positions: dict,          # mutable: {model_name: 0|1} — updated in place
+    trained:    dict,
+    state:      StrategyState,
 ) -> None:
-    """
-    Fetch the latest bar, compute features, run all models, resolve
-    BUY / HOLD / SELL / CASH actions, and print a formatted signal table.
-    `positions` carries state between calls so SELL signals can be detected.
-    """
     live_bar = fetch_latest_bar(ticker)
     if live_bar is None:
         print(f"  [{ticker}] No intraday data — market may not have opened yet.")
@@ -275,63 +353,14 @@ def poll_once(
 
     X_live, _ = build_live_feature_row(history_df, live_bar)
     if X_live is None:
-        print(f"  [{ticker}] Could not compute features for latest bar.")
+        print(f"  [{ticker}] Feature computation failed.")
         return
 
-    current_price = float(live_bar["Close"])
-    ts            = datetime.now().strftime("%H:%M:%S")
+    price               = float(live_bar["Close"])
+    consensus, votes    = get_consensus(trained, X_live)
+    action              = resolve_strategy_action(state, consensus, price)
 
-    model_map = {
-        "Baseline":     trained["Baseline"],
-        "Logistic Reg": trained["LR"],
-        "Random Forest":trained["RF"],
-        "DQN Agent":    trained["DQN"],
-        "Ensemble":     trained["Ensemble"],
-    }
-
-    print(f"\n  [{ts}]  {ticker}  ${current_price:.2f}")
-    print(f"  {'─'*54}")
-    print(f"  {'Model':<18} {'Signal':<8} {'Action':<6}  {'Change'}")
-    print(f"  {'─'*54}")
-
-    new_preds = {}
-    for name, model in model_map.items():
-        new_pred = int(model.predict(X_live)[0])
-        prev     = positions.get(name, 0)          # default: start in cash
-        label, arrow, colour = resolve_action(prev, new_pred)
-
-        # Describe what changed
-        if (prev, new_pred) == (0, 1):
-            change = "entering position"
-        elif (prev, new_pred) == (1, 0):
-            change = "*** EXITING POSITION ***"
-        elif (prev, new_pred) == (1, 1):
-            change = "holding"
-        else:
-            change = "staying in cash"
-
-        print(f"  {name:<18} {new_pred:<8} {colour}{label}{RESET}  {arrow}  {change}")
-
-        new_preds[name]   = new_pred
-        positions[name]   = new_pred              # persist state for next poll
-
-    print(f"  {'─'*54}")
-
-    # Consensus from non-baseline models
-    non_base  = {k: v for k, v in new_preds.items() if k != "Baseline"}
-    buy_votes = sum(non_base.values())
-    total     = len(non_base)
-
-    # Consensus action uses Ensemble position state
-    prev_consensus  = positions.get("_consensus", 0)
-    new_consensus   = 1 if buy_votes >= total / 2 else 0
-    c_label, c_arrow, c_colour = resolve_action(prev_consensus, new_consensus)
-    positions["_consensus"] = new_consensus
-
-    print(f"  {'CONSENSUS':<18} {new_consensus:<8} "
-          f"{c_colour}{c_label}{RESET}  {c_arrow}  "
-          f"({buy_votes}/{total} models say BUY)")
-    print(f"  {'─'*54}")
+    print_strategy_signal(action, ticker, price, state, votes, consensus)
 
 
 # ---------------------------------------------------------------------------
@@ -339,39 +368,34 @@ def poll_once(
 # ---------------------------------------------------------------------------
 
 def run_monitor(
-    tickers: list[str],
-    interval_minutes: int = 5,
+    tickers:           list[str],
+    interval_minutes:  int  = 5,
     skip_market_check: bool = False,
 ) -> None:
-    """
-    Continuously poll all tickers every `interval_minutes` minutes.
-    Trains models once at startup, then loops until Ctrl-C.
-    """
+
     print("\n" + "="*60)
-    print("  LIVE SIGNAL MONITOR")
+    print(f"  {BOLD}TRADING STRATEGY MONITOR{RESET}")
     print(f"  Tickers  : {', '.join(tickers)}")
     print(f"  Interval : every {interval_minutes} minute(s)")
+    print(f"  Strategy : FLAT → BUY → HOLD → SELL → FLAT")
     print(f"  Market   : {'always run' if skip_market_check else 'NYSE/NASDAQ hours only'}")
     print("  Press Ctrl-C to stop.")
     print("="*60 + "\n")
 
-    # ------------------------------------------------------------------
-    # Step 1 — download full history and train all models (done once)
-    # ------------------------------------------------------------------
     from datetime import date
     today_str = date.today().isoformat()
 
-    history   = {}   # ticker -> raw OHLCV DataFrame
-    trained   = {}   # ticker -> dict of trained models
-    positions = {}   # ticker -> {model_name: 0|1} position state across polls
+    history = {}
+    trained = {}
+    states  = {}   # ticker -> StrategyState
 
     for ticker in tickers:
         print(f"[STARTUP] Downloading history for {ticker}...")
         try:
-            history[ticker]   = download_stock_data(ticker, start="2015-01-01", end=today_str)
+            history[ticker] = download_stock_data(ticker, start="2015-01-01", end=today_str)
             print(f"[STARTUP] Training models for {ticker}...")
-            trained[ticker]   = train_models_on_history(ticker, history[ticker])
-            positions[ticker] = {}   # all models start in cash (position=0)
+            trained[ticker] = train_models_on_history(ticker, history[ticker])
+            states[ticker]  = StrategyState(ticker=ticker)
         except Exception as e:
             print(f"[ERROR] Could not initialise {ticker}: {e}")
 
@@ -379,42 +403,48 @@ def run_monitor(
         print("[ERROR] No tickers could be initialised. Exiting.")
         return
 
-    print("\n[STARTUP COMPLETE] Entering monitoring loop...\n")
+    print(f"\n{GREEN}[READY] Strategy is live. Watching: {', '.join(trained.keys())}{RESET}\n")
 
-    # ------------------------------------------------------------------
-    # Step 2 — polling loop
-    # ------------------------------------------------------------------
     try:
         while True:
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             if not skip_market_check and not is_market_open():
-                secs  = seconds_until_open()
-                hrs   = int(secs // 3600)
-                mins  = int((secs % 3600) // 60)
-                print(f"[{now_str}] Market is closed. Next open in {hrs}h {mins}m. Sleeping...")
-                # Sleep in 60-second increments so Ctrl-C is responsive
+                secs = seconds_until_open()
+                hrs  = int(secs // 3600)
+                mins = int((secs % 3600) // 60)
+                print(f"[{now_str}] Market closed — next open in {hrs}h {mins}m. Sleeping...")
                 for _ in range(min(int(secs), 300)):
                     time.sleep(1)
                 continue
 
-            print(f"\n{'='*60}")
-            print(f"  POLL  {now_str}")
-            print(f"{'='*60}")
-
-            for ticker in tickers:
-                if ticker not in trained:
-                    continue
+            for ticker in trained:
                 try:
-                    poll_once(ticker, history[ticker], trained[ticker], positions[ticker])
+                    poll_once(ticker, history[ticker], trained[ticker], states[ticker])
                 except Exception as e:
                     print(f"  [{ticker}] Poll error: {e}")
 
-            print(f"\n  Next update in {interval_minutes} minute(s)...")
+            print(f"\n  Next check in {interval_minutes} minute(s)...  [{now_str}]")
             time.sleep(interval_minutes * 60)
 
     except KeyboardInterrupt:
-        print("\n\n[MONITOR] Stopped by user. Goodbye.")
+        print(f"\n\n{YELLOW}[MONITOR] Stopped by user.{RESET}")
+        # Print final session summary
+        print(f"\n{'='*60}")
+        print("  SESSION SUMMARY")
+        print(f"{'='*60}")
+        for ticker, state in states.items():
+            print(f"\n  {ticker}")
+            if state.trade_log:
+                total_pnl = sum(t["pnl%"] for t in state.trade_log)
+                wins      = sum(1 for t in state.trade_log if t["pnl%"] > 0)
+                print(f"  Completed trades : {len(state.trade_log)}")
+                print(f"  Win rate         : {wins}/{len(state.trade_log)}")
+                print(f"  Total P&L        : {'+' if total_pnl >= 0 else ''}{total_pnl:.2f}%")
+            else:
+                status = "LONG (open position)" if state.position == Position.LONG else "FLAT"
+                print(f"  No completed trades this session  |  Status: {status}")
+        print(f"{'='*60}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -422,28 +452,10 @@ def run_monitor(
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Continuous live BUY/HOLD signal monitor."
-    )
-    parser.add_argument(
-        "--ticker",
-        nargs="+",
-        default=TICKERS,
-        metavar="TICKER",
-        help=f"Ticker(s) to watch (default: {TICKERS})",
-    )
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=5,
-        metavar="MINUTES",
-        help="How often to refresh signals in minutes (default: 5)",
-    )
-    parser.add_argument(
-        "--no-market-check",
-        action="store_true",
-        help="Disable market-hours gating (useful for testing outside trading hours)",
-    )
+    parser = argparse.ArgumentParser(description="Live trading strategy monitor.")
+    parser.add_argument("--ticker", nargs="+", default=TICKERS, metavar="TICKER")
+    parser.add_argument("--interval", type=int, default=5, metavar="MINUTES")
+    parser.add_argument("--no-market-check", action="store_true")
     return parser.parse_args()
 
 
