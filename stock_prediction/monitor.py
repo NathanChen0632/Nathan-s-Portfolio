@@ -232,18 +232,48 @@ def train_models_on_history(ticker: str, history_df: pd.DataFrame) -> dict:
 # Single poll
 # ---------------------------------------------------------------------------
 
-def poll_once(ticker: str, history_df: pd.DataFrame, trained: dict) -> None:
+# ---------------------------------------------------------------------------
+# Action resolution
+# ---------------------------------------------------------------------------
+
+# Position state: 1 = currently holding, 0 = currently in cash
+# Transition table:
+#   prev=0, new=1  → BUY   (enter position)
+#   prev=1, new=1  → HOLD  (stay in)
+#   prev=1, new=0  → SELL  (exit position)
+#   prev=0, new=0  → CASH  (stay out)
+
+ACTION_LABELS = {
+    (0, 1): ("BUY ",  "▲", "\033[92m"),   # green
+    (1, 1): ("HOLD",  "─", "\033[94m"),   # blue
+    (1, 0): ("SELL",  "▼", "\033[91m"),   # red
+    (0, 0): ("CASH",  " ", "\033[90m"),   # grey
+}
+RESET = "\033[0m"
+
+
+def resolve_action(prev: int, new: int) -> tuple[str, str, str]:
+    """Return (label, arrow, colour) for a prev→new position transition."""
+    return ACTION_LABELS[(prev, new)]
+
+
+def poll_once(
+    ticker: str,
+    history_df: pd.DataFrame,
+    trained: dict,
+    positions: dict,          # mutable: {model_name: 0|1} — updated in place
+) -> None:
     """
-    Fetch the latest bar, compute features, run all models, print signals.
+    Fetch the latest bar, compute features, run all models, resolve
+    BUY / HOLD / SELL / CASH actions, and print a formatted signal table.
+    `positions` carries state between calls so SELL signals can be detected.
     """
     live_bar = fetch_latest_bar(ticker)
     if live_bar is None:
         print(f"  [{ticker}] No intraday data — market may not have opened yet.")
         return
 
-    feature_cols = trained["feature_cols"]
     X_live, _ = build_live_feature_row(history_df, live_bar)
-
     if X_live is None:
         print(f"  [{ticker}] Could not compute features for latest bar.")
         return
@@ -251,31 +281,57 @@ def poll_once(ticker: str, history_df: pd.DataFrame, trained: dict) -> None:
     current_price = float(live_bar["Close"])
     ts            = datetime.now().strftime("%H:%M:%S")
 
-    models = {
-        "Baseline":          trained["Baseline"],
-        "Logistic Reg":      trained["LR"],
-        "Random Forest":     trained["RF"],
-        "DQN Agent":         trained["DQN"],
-        "Ensemble":          trained["Ensemble"],
+    model_map = {
+        "Baseline":     trained["Baseline"],
+        "Logistic Reg": trained["LR"],
+        "Random Forest":trained["RF"],
+        "DQN Agent":    trained["DQN"],
+        "Ensemble":     trained["Ensemble"],
     }
 
-    preds = {name: int(m.predict(X_live)[0]) for name, m in models.items()}
+    print(f"\n  [{ts}]  {ticker}  ${current_price:.2f}")
+    print(f"  {'─'*54}")
+    print(f"  {'Model':<18} {'Signal':<8} {'Action':<6}  {'Change'}")
+    print(f"  {'─'*54}")
 
-    # Consensus (exclude baseline)
-    non_base = {k: v for k, v in preds.items() if k != "Baseline"}
+    new_preds = {}
+    for name, model in model_map.items():
+        new_pred = int(model.predict(X_live)[0])
+        prev     = positions.get(name, 0)          # default: start in cash
+        label, arrow, colour = resolve_action(prev, new_pred)
+
+        # Describe what changed
+        if (prev, new_pred) == (0, 1):
+            change = "entering position"
+        elif (prev, new_pred) == (1, 0):
+            change = "*** EXITING POSITION ***"
+        elif (prev, new_pred) == (1, 1):
+            change = "holding"
+        else:
+            change = "staying in cash"
+
+        print(f"  {name:<18} {new_pred:<8} {colour}{label}{RESET}  {arrow}  {change}")
+
+        new_preds[name]   = new_pred
+        positions[name]   = new_pred              # persist state for next poll
+
+    print(f"  {'─'*54}")
+
+    # Consensus from non-baseline models
+    non_base  = {k: v for k, v in new_preds.items() if k != "Baseline"}
     buy_votes = sum(non_base.values())
     total     = len(non_base)
-    consensus = "BUY / HOLD" if buy_votes >= total / 2 else "HOLD CASH"
-    arrow     = "▲" if consensus == "BUY / HOLD" else "▼"
 
-    print(f"\n  [{ts}]  {ticker}  ${current_price:.2f}")
-    print(f"  {'─'*50}")
-    for name, pred in preds.items():
-        label = "BUY/HOLD " if pred == 1 else "HOLD CASH"
-        bar   = "█" * (pred * 8)
-        print(f"  {name:<18} {label}  {bar}")
-    print(f"  {'─'*50}")
-    print(f"  CONSENSUS  {arrow}  {consensus}  ({buy_votes}/{total} models say BUY)")
+    # Consensus action uses Ensemble position state
+    prev_consensus  = positions.get("_consensus", 0)
+    new_consensus   = 1 if buy_votes >= total / 2 else 0
+    c_label, c_arrow, c_colour = resolve_action(prev_consensus, new_consensus)
+    positions["_consensus"] = new_consensus
+
+    print(f"  {'CONSENSUS':<18} {new_consensus:<8} "
+          f"{c_colour}{c_label}{RESET}  {c_arrow}  "
+          f"({buy_votes}/{total} models say BUY)")
+    print(f"  {'─'*54}")
 
 
 # ---------------------------------------------------------------------------
@@ -307,13 +363,15 @@ def run_monitor(
 
     history   = {}   # ticker -> raw OHLCV DataFrame
     trained   = {}   # ticker -> dict of trained models
+    positions = {}   # ticker -> {model_name: 0|1} position state across polls
 
     for ticker in tickers:
         print(f"[STARTUP] Downloading history for {ticker}...")
         try:
-            history[ticker] = download_stock_data(ticker, start="2015-01-01", end=today_str)
+            history[ticker]   = download_stock_data(ticker, start="2015-01-01", end=today_str)
             print(f"[STARTUP] Training models for {ticker}...")
-            trained[ticker] = train_models_on_history(ticker, history[ticker])
+            trained[ticker]   = train_models_on_history(ticker, history[ticker])
+            positions[ticker] = {}   # all models start in cash (position=0)
         except Exception as e:
             print(f"[ERROR] Could not initialise {ticker}: {e}")
 
@@ -348,7 +406,7 @@ def run_monitor(
                 if ticker not in trained:
                     continue
                 try:
-                    poll_once(ticker, history[ticker], trained[ticker])
+                    poll_once(ticker, history[ticker], trained[ticker], positions[ticker])
                 except Exception as e:
                     print(f"  [{ticker}] Poll error: {e}")
 
