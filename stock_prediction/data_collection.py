@@ -9,7 +9,7 @@ import yfinance as yf
 import pandas as pd
 
 
-TICKERS = ["AAPL", "MSFT", "SPY"]
+TICKERS = ["SPY", "QQQ", "VOO"]
 START_DATE = "2015-01-01"
 END_DATE = "2024-12-31"
 
