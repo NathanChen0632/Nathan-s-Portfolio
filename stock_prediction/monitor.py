@@ -41,6 +41,19 @@ import pandas as pd
 import pytz
 import yfinance as yf
 
+# Auto-load .env file so credentials work without manually running `source .env`
+try:
+    from dotenv import load_dotenv
+    # Walk up from this file's directory to find .env
+    _here = os.path.dirname(os.path.abspath(__file__))
+    for _candidate in [_here, os.path.dirname(_here)]:
+        _env_path = os.path.join(_candidate, ".env")
+        if os.path.exists(_env_path):
+            load_dotenv(_env_path)
+            break
+except ImportError:
+    pass  # dotenv not installed — fall back to manual env vars
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stock_prediction.data_collection import download_stock_data, TICKERS
