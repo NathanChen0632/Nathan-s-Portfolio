@@ -3,38 +3,42 @@ main.py
 -------
 Entry point for the CS5100 Stock Direction Prediction project.
 
+Uses a single Deep Q-Network (DQN) reinforcement learning agent trained
+on 10 years of daily data (2015-2025). The RL agent directly optimises
+portfolio returns rather than prediction accuracy, making it better suited
+to the trading objective than supervised classifiers.
+
 Usage
 -----
-  python main.py                    # runs all tickers with default settings
-  python main.py --ticker AAPL      # single ticker
-  python main.py --ticker AAPL MSFT # multiple tickers
+  python stock_prediction/main.py                        # backtest SPY, QQQ, XLK
+  python stock_prediction/main.py --ticker AAPL          # single ticker
+  python stock_prediction/main.py --signal               # live one-shot signal
+  python stock_prediction/main.py --monitor              # continuous live monitor
+  python stock_prediction/main.py --monitor --email      # monitor + email alerts
 
 Workflow
 --------
-  1. Download historical OHLCV data (yfinance)
-  2. Engineer technical features
-  3. Chronological train / val / test split (70 / 15 / 15)
-  4. Train Baseline, Logistic Regression, Random Forest, and DQN RL agent
-  5. Evaluate on validation set (hyperparameter awareness) and test set
-  6. Plot confusion matrices, feature importance, LR coefficients
-  7. Run backtesting simulation vs buy-and-hold for all models
+  1. Download 10 years of OHLCV data (2015-2025)
+  2. Engineer technical features (RSI, MACD, MAs, volatility, volume)
+  3. Chronological 70/15/15 train-val-test split
+  4. Train DQN agent on train+val (full pre-test history)
+  5. Evaluate on held-out test set
+  6. Plot confusion matrix and equity curve vs buy-and-hold
 """
 
 import argparse
 import os
 import sys
+import numpy as np
 
-# Ensure the package root is on the path when run as a script
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stock_prediction.data_collection import download_stock_data, TICKERS
 from stock_prediction.features import build_features, get_feature_columns
-from stock_prediction.models import chronological_split, train_all_models, MajorityVoteEnsemble
+from stock_prediction.models import chronological_split
 from stock_prediction.evaluation import (
     evaluate_model,
     plot_confusion_matrix,
-    plot_feature_importance,
-    plot_lr_coefficients,
     print_summary_table,
 )
 from stock_prediction.backtesting import (
@@ -57,118 +61,73 @@ def run_pipeline(ticker: str):
     print(f"  TICKER: {ticker}")
     print(f"{'#'*60}")
 
-    # 1. Data collection
-    print("\n[1/5] Downloading data...")
+    # 1. Download 10 years of data
+    print("\n[1/4] Downloading 10 years of data (2015-2025)...")
     df = download_stock_data(ticker)
 
     # 2. Feature engineering
-    print("\n[2/5] Engineering features...")
-    feat_df = build_features(df)
+    print("\n[2/4] Engineering features...")
+    feat_df      = build_features(df)
     feature_cols = get_feature_columns(feat_df)
     print(f"  Features: {len(feature_cols)}  |  Samples: {len(feat_df)}")
 
-    # 3. Chronological split
-    print("\n[3/5] Splitting data (70% train / 15% val / 15% test)...")
+    # 3. Chronological split (70% train / 15% val / 15% test)
+    print("\n[3/4] Splitting data...")
     splits = chronological_split(feat_df, feature_cols)
     print(f"  Train: {len(splits['X_train'])}  Val: {len(splits['X_val'])}  Test: {len(splits['X_test'])}")
 
-    # 4. Train supervised models
-    print("\n[4/6] Training supervised models...")
-    models = train_all_models(splits["X_train"], splits["y_train"])
+    # Merge train+val — agent learns from all pre-test history
+    X_train_full  = np.concatenate([splits["X_train"], splits["X_val"]])
+    returns_train = feat_df["daily_return"].values[: len(X_train_full)]
 
-    # 4b. Train RL agent
-    # Pull daily_return from the training slice of feat_df so the environment
-    # can compute portfolio rewards (action * daily_return - tx_cost).
-    print("\n[4b/6] Training RL (DQN) agent...")
-    n_train = len(splits["X_train"])
-    train_slice_returns = feat_df["daily_return"].values[:n_train]
-
-    dqn_agent = train_dqn_agent(
-        X_train=splits["X_train"],
-        daily_returns_train=train_slice_returns,
+    # 4. Train DQN agent on full pre-test history
+    print("\n[4/4] Training DQN agent on 10 years of data (50 episodes)...")
+    dqn = train_dqn_agent(
+        X_train=X_train_full,
+        daily_returns_train=returns_train,
+        n_episodes=50,
     )
-    models["DQN (RL Agent)"] = dqn_agent
 
-    # 4c. Build ensemble from the three non-baseline models
-    ensemble = MajorityVoteEnsemble([
-        models["Logistic Regression"],
-        models["Random Forest"],
-        models["DQN (RL Agent)"],
-    ])
-    models["Ensemble (LR + RF + DQN)"] = ensemble
+    # Evaluate on held-out test set
+    print("\n  Evaluating on held-out test set...")
+    results = {"DQN (RL Agent)": evaluate_model(
+        "DQN (RL Agent)", dqn, splits["X_test"], splits["y_test"]
+    )}
+    plot_confusion_matrix(f"{ticker}_DQN", dqn, splits["X_test"], splits["y_test"])
+    print_summary_table(results)
 
-    # 5. Evaluate on test set
-    print("\n[5/6] Evaluating on test set...")
-    test_results = {}
-    for name, model in models.items():
-        test_results[name] = evaluate_model(name, model, splits["X_test"], splits["y_test"])
-        plot_confusion_matrix(f"{ticker}_{name}", model, splits["X_test"], splits["y_test"])
+    # Backtest: DQN strategy vs buy-and-hold
+    print(f"\n  Running backtest...")
+    bt_df   = run_backtest(dqn, splits["test_df"], feature_cols)
+    metrics = compute_backtest_metrics(bt_df)
+    print_backtest_metrics(metrics, f"{ticker} — DQN (RL Agent)")
+    plot_equity_curve(bt_df, f"{ticker}_DQN")
 
-    print_summary_table(test_results)
-
-    # Plot model insights
-    if "Random Forest" in models:
-        plot_feature_importance(models["Random Forest"], feature_cols)
-    if "Logistic Regression" in models:
-        plot_lr_coefficients(models["Logistic Regression"], feature_cols)
-
-    # 6. Backtesting
-    print(f"\n[6/6] Running trading simulations on test set...")
-    for name, model in models.items():
-        if name == "Baseline (Majority Class)":
-            continue  # baseline equity curve not informative
-        bt_df   = run_backtest(model, splits["test_df"], feature_cols)
-        metrics = compute_backtest_metrics(bt_df)
-        print_backtest_metrics(metrics, f"{ticker} — {name}")
-        plot_equity_curve(bt_df, f"{ticker}_{name}")
-
-    return test_results
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="CS5100 Stock Direction Prediction — ML Pipeline"
+        description="CS5100 — DQN RL Stock Trading Strategy"
+    )
+    parser.add_argument("--ticker", nargs="+", default=TICKERS, metavar="TICKER")
+    parser.add_argument(
+        "--signal", action="store_true",
+        help="One-shot live signal for today.",
     )
     parser.add_argument(
-        "--ticker",
-        nargs="+",
-        default=TICKERS,
-        metavar="TICKER",
-        help=f"Stock ticker(s) to analyse (default: {TICKERS})",
+        "--monitor", action="store_true",
+        help="Continuous live monitor (polls every --interval minutes).",
     )
+    parser.add_argument("--interval", type=int, default=5, metavar="MINUTES")
+    parser.add_argument("--no-market-check", action="store_true")
     parser.add_argument(
-        "--signal",
-        action="store_true",
-        help="Instead of running the full backtest pipeline, print a live "
-             "BUY/HOLD signal for today based on the latest available data.",
-    )
-    parser.add_argument(
-        "--monitor",
-        action="store_true",
-        help="Continuously poll for live data and print updated signals "
-             "every --interval minutes during market hours.",
-    )
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=5,
-        metavar="MINUTES",
-        help="Polling interval in minutes when using --monitor (default: 5)",
-    )
-    parser.add_argument(
-        "--no-market-check",
-        action="store_true",
-        help="Disable market-hours gating for --monitor (useful for testing)",
-    )
-    parser.add_argument(
-        "--email",
-        action="store_true",
-        help="Send email alerts on BUY/SELL signals (requires SMTP_USER, "
-             "SMTP_PASSWORD, ALERT_TO env vars).",
+        "--email", action="store_true",
+        help="Send email alerts on BUY/SELL signals.",
     )
     return parser.parse_args()
 
@@ -177,7 +136,6 @@ def main():
     args = parse_args()
 
     if args.monitor:
-        # Continuous monitoring mode — trains once, polls every N minutes
         run_monitor(
             tickers=[t.upper() for t in args.ticker],
             interval_minutes=args.interval,
@@ -187,22 +145,19 @@ def main():
         return
 
     if args.signal:
-        # One-shot live signal — train on full history and predict today
         for ticker in args.ticker:
             try:
                 generate_live_signal(ticker.upper())
             except Exception as e:
-                print(f"\n[ERROR] Failed for {ticker}: {e}")
-                import traceback; traceback.print_exc()
+                print(f"\n[ERROR] {ticker}: {e}")
         return
 
-    # Default: full historical backtest pipeline
-    all_results = {}
+    # Default: full backtest pipeline
     for ticker in args.ticker:
         try:
-            all_results[ticker] = run_pipeline(ticker.upper())
+            run_pipeline(ticker.upper())
         except Exception as e:
-            print(f"\n[ERROR] Failed for {ticker}: {e}")
+            print(f"\n[ERROR] {ticker}: {e}")
             import traceback; traceback.print_exc()
 
     print("\n\nAll results saved to the 'results/' directory.")

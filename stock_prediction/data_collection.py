@@ -11,7 +11,7 @@ import pandas as pd
 
 TICKERS = ["SPY", "QQQ", "XLK"]
 START_DATE = "2015-01-01"
-END_DATE = "2024-12-31"
+END_DATE = "2025-01-01"
 
 
 def download_stock_data(ticker: str, start: str = START_DATE, end: str = END_DATE) -> pd.DataFrame:
