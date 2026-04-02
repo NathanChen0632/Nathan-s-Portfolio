@@ -46,17 +46,20 @@ def run_backtest(
     test_df: pd.DataFrame,
     feature_cols: list,
     initial_capital: float = 10_000.0,
+    prices: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """
     Run the model-based strategy on the test set.
 
     Parameters
     ----------
-    model        : trained sklearn estimator
-    test_df      : the test slice of the feature DataFrame (must contain 'Target'
-                   and the raw close price can be reconstructed from daily_return)
+    model        : trained DQNAgent (or any sklearn-compatible estimator)
+    test_df      : the test slice of the feature DataFrame
     feature_cols : list of feature column names
     initial_capital : starting cash ($)
+    prices       : optional close-price array aligned to test_df.
+                   When provided and model is a DQNAgent, the full
+                   disciplined trading rules (stops, targets, time) apply.
 
     Returns
     -------
@@ -65,7 +68,12 @@ def run_backtest(
       strategy_equity, bah_equity
     """
     X_test = test_df[feature_cols].values
-    signals = model.predict(X_test)   # 1 = long, 0 = cash
+
+    # Use full trading-rules inference if prices are available
+    if prices is not None and hasattr(model, "_predict_with_env"):
+        signals = model.predict(X_test, prices=prices, feature_cols=feature_cols)
+    else:
+        signals = model.predict(X_test)
 
     # daily_return is already in test_df (engineered feature)
     daily_ret = test_df["daily_return"].values

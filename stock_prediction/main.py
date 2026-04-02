@@ -77,14 +77,22 @@ def run_pipeline(ticker: str):
     print(f"  Train: {len(splits['X_train'])}  Val: {len(splits['X_val'])}  Test: {len(splits['X_test'])}")
 
     # Merge train+val — agent learns from all pre-test history
+    n_train_full  = len(splits["X_train"]) + len(splits["X_val"])
     X_train_full  = np.concatenate([splits["X_train"], splits["X_val"]])
-    returns_train = feat_df["daily_return"].values[: len(X_train_full)]
+    returns_train = feat_df["daily_return"].values[:n_train_full]
 
-    # 4. Train DQN agent on full pre-test history
-    print("\n[4/4] Training DQN agent on 10 years of data (50 episodes)...")
+    # Extract close prices aligned to feat_df (needed for stop/target calculation)
+    prices_all    = df.loc[feat_df.index, "Close"].values.flatten()
+    prices_train  = prices_all[:n_train_full]
+    prices_test   = prices_all[n_train_full + len(splits["X_val"]):]
+
+    # 4. Train DQN agent with full disciplined trading strategy
+    print("\n[4/4] Training DQN agent with R/R gating, ATR stops, volume & MA rules...")
     dqn = train_dqn_agent(
         X_train=X_train_full,
         daily_returns_train=returns_train,
+        prices_train=prices_train,
+        feature_cols=feature_cols,
         n_episodes=50,
     )
 
@@ -96,9 +104,11 @@ def run_pipeline(ticker: str):
     plot_confusion_matrix(f"{ticker}_DQN", dqn, splits["X_test"], splits["y_test"])
     print_summary_table(results)
 
-    # Backtest: DQN strategy vs buy-and-hold
-    print(f"\n  Running backtest...")
-    bt_df   = run_backtest(dqn, splits["test_df"], feature_cols)
+    # Backtest: DQN strategy vs buy-and-hold (with full trading rules active)
+    print(f"\n  Running backtest with disciplined trading rules...")
+    prices_test_full = prices_all[n_train_full:]
+    bt_df   = run_backtest(dqn, splits["test_df"], feature_cols,
+                           prices=prices_test_full[:len(splits["test_df"])])
     metrics = compute_backtest_metrics(bt_df)
     print_backtest_metrics(metrics, f"{ticker} — DQN (RL Agent)")
     plot_equity_curve(bt_df, f"{ticker}_DQN")

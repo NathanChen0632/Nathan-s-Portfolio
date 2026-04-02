@@ -105,11 +105,14 @@ class Position(Enum):
 @dataclass
 class StrategyState:
     """Tracks the live trading state for one ticker."""
-    ticker:      str
-    position:    Position = Position.FLAT
-    entry_price: float    = 0.0
-    entry_time:  str      = ""
-    trade_log:   list     = field(default_factory=list)   # history of completed trades
+    ticker:       str
+    position:     Position = Position.FLAT
+    entry_price:  float    = 0.0
+    stop_price:   float    = 0.0
+    target_price: float    = 0.0
+    entry_time:   str      = ""
+    days_held:    int      = 0
+    trade_log:    list     = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -320,11 +323,14 @@ def train_models_on_history(ticker: str, history_df: pd.DataFrame) -> dict:
     feat_df      = build_features(history_df)
     feature_cols = get_feature_columns(feat_df)
     X            = feat_df[feature_cols].values
+    prices       = history_df.loc[feat_df.index, "Close"].values.flatten()
 
-    print(f"  [{ticker}] Training DQN on {len(X)} samples ({len(feature_cols)} features)...")
+    print(f"  [{ticker}] Training DQN with disciplined strategy on {len(X)} samples...")
     dqn = train_dqn_agent(
         X_train=X,
         daily_returns_train=feat_df["daily_return"].values,
+        prices_train=prices,
+        feature_cols=feature_cols,
         n_episodes=50,
     )
 
@@ -349,37 +355,70 @@ def get_consensus(trained: dict, X_live: np.ndarray) -> tuple[int, dict[str, int
     return pred, votes
 
 
-def resolve_strategy_action(state: StrategyState, consensus: int, price: float) -> str:
+def resolve_strategy_action(
+    state:        StrategyState,
+    signal:       int,
+    price:        float,
+    features:     np.ndarray,
+    feature_cols: list,
+) -> str:
     """
-    Apply the consensus signal to the current position state and return
-    the action string.  Updates state in place.
+    Apply DQN signal to current position state.
+    On BUY: computes ATR-based stop and 2:1 target and stores them in state.
+    Updates state in place. Returns action string.
     """
+    from stock_prediction.rl_agent import TradingConfig
+    cfg = TradingConfig()
+
     if state.position == Position.FLAT:
-        if consensus == 1:
-            # Enter position
-            state.position    = Position.LONG
-            state.entry_price = price
-            state.entry_time  = datetime.now().strftime("%H:%M:%S")
+        if signal == 1:
+            # Compute stop and target at entry using ATR
+            atr_idx    = feature_cols.index("atr14_pct") if "atr14_pct" in feature_cols else None
+            atr_pct    = float(features[atr_idx]) if atr_idx is not None else 0.015
+            stop_dist  = cfg.stop_atr_mult * atr_pct * price
+            stop_price = price - stop_dist
+            tgt_price  = price + cfg.min_rr_ratio * stop_dist
+
+            state.position     = Position.LONG
+            state.entry_price  = price
+            state.stop_price   = stop_price
+            state.target_price = tgt_price
+            state.entry_time   = datetime.now().strftime("%H:%M:%S")
+            state.days_held    = 0
             return "BUY"
-        else:
-            return "WAIT"
+        return "WAIT"
 
     else:  # Position.LONG
-        if consensus == 0:
-            # Exit position
+        state.days_held += 1
+
+        # Check if stop or target was hit regardless of DQN signal
+        if price <= state.stop_price:
+            signal = 0   # force exit — stop hit
+        elif price >= state.target_price:
+            signal = 0   # force exit — target hit
+        elif state.days_held >= cfg.max_holding_days:
+            signal = 0   # force exit — time stop
+
+        if signal == 0:
             pnl = (price - state.entry_price) / state.entry_price * 100
+            reason = "stop hit" if price <= state.stop_price else (
+                     "target hit" if price >= state.target_price else
+                     "time stop" if state.days_held >= cfg.max_holding_days else "signal")
             state.trade_log.append({
-                "entry": state.entry_price,
-                "exit":  price,
-                "pnl%":  pnl,
-                "time":  datetime.now().strftime("%H:%M:%S"),
+                "entry":  state.entry_price,
+                "exit":   price,
+                "pnl%":   pnl,
+                "time":   datetime.now().strftime("%H:%M:%S"),
+                "reason": reason,
             })
-            state.position    = Position.FLAT
-            state.entry_price = 0.0
-            state.entry_time  = ""
+            state.position     = Position.FLAT
+            state.entry_price  = 0.0
+            state.stop_price   = 0.0
+            state.target_price = 0.0
+            state.days_held    = 0
+            state.entry_time   = ""
             return "SELL"
-        else:
-            return "HOLD"
+        return "HOLD"
 
 
 # ---------------------------------------------------------------------------
@@ -400,15 +439,21 @@ def print_strategy_signal(
     if action == "BUY":
         colour  = GREEN
         banner  = f"  {BOLD}{GREEN}>>> BUY {ticker} NOW  @  ${price:.2f} <<<{RESET}"
-        summary = f"  {GREEN}Entering position at ${price:.2f}{RESET}"
+        summary = (
+            f"  {GREEN}Entry: ${price:.2f}  |  "
+            f"Stop: ${state.stop_price:.2f}  |  "
+            f"Target: ${state.target_price:.2f}  |  "
+            f"R/R: 2:1{RESET}"
+        )
     elif action == "SELL":
         colour  = RED
         pnl     = (price - state.entry_price) / state.entry_price * 100
         sign    = "+" if pnl >= 0 else ""
+        reason  = state.trade_log[-1]["reason"] if state.trade_log else "signal"
         banner  = f"  {BOLD}{RED}>>> SELL {ticker} NOW  @  ${price:.2f} <<<{RESET}"
         summary = (
-            f"  {RED}Exiting position  |  Entry: ${state.entry_price:.2f}  "
-            f"P&L: {sign}{pnl:.2f}%{RESET}"
+            f"  {RED}Reason: {reason}  |  Entry: ${state.entry_price:.2f}  "
+            f"|  P&L: {sign}{pnl:.2f}%{RESET}"
         )
     elif action == "HOLD":
         colour  = BLUE
@@ -416,13 +461,15 @@ def print_strategy_signal(
         sign    = "+" if pnl >= 0 else ""
         banner  = f"  {BOLD}{BLUE}HOLD {ticker}  @  ${price:.2f}{RESET}"
         summary = (
-            f"  {BLUE}Holding since ${state.entry_price:.2f} (entry: {state.entry_time})  "
+            f"  {BLUE}Day {state.days_held}  |  "
+            f"Entry: ${state.entry_price:.2f}  Stop: ${state.stop_price:.2f}  "
+            f"Target: ${state.target_price:.2f}  |  "
             f"Unrealised P&L: {sign}{pnl:.2f}%{RESET}"
         )
     else:  # WAIT
         colour  = GREY
         banner  = f"  {GREY}WAIT — no position in {ticker}  (${price:.2f}){RESET}"
-        summary = f"  {GREY}Watching for a BUY signal...{RESET}"
+        summary = f"  {GREY}Watching for a valid BUY setup (R/R ≥ 2:1, volume confirmed)...{RESET}"
 
     dqn_signal = votes.get("DQN Agent", consensus)
     dot        = f"{GREEN}●{RESET}" if dqn_signal == 1 else f"{RED}●{RESET}"
@@ -469,11 +516,23 @@ def poll_once(
         print(f"  [{ticker}] Feature computation failed.")
         return
 
-    price            = float(live_bar["Close"])
-    consensus, votes = get_consensus(trained, X_live)
-    action           = resolve_strategy_action(state, consensus, price)
+    price = float(live_bar["Close"])
 
-    print_strategy_signal(action, ticker, price, state, votes, consensus)
+    # Use predict_step so the agent has full trade context (stop, target, days held)
+    pred = trained["DQN"].predict_step(
+        features=X_live[0],
+        position=1 if state.position == Position.LONG else 0,
+        days_held=state.days_held,
+        entry_price=state.entry_price,
+        stop_price=state.stop_price,
+        target_price=state.target_price,
+        current_price=price,
+    )
+
+    votes  = {"DQN Agent": pred}
+    action = resolve_strategy_action(state, pred, price, X_live[0], trained["feature_cols"])
+
+    print_strategy_signal(action, ticker, price, state, votes, pred)
 
     # Send email only on actionable signals (not HOLD or WAIT)
     if email_cfg and action in ("BUY", "SELL"):

@@ -46,29 +46,38 @@ def generate_live_signal(ticker: str) -> None:
     feat_df      = build_features(df)
     feature_cols = get_feature_columns(feat_df)
 
-    # 3. Train DQN on ALL available history (no held-out set needed for live signal)
+    # 3. Train DQN on ALL available history with full trading rules
     X_train       = feat_df[feature_cols].values
     returns_train = feat_df["daily_return"].values
+    prices_train  = df.loc[feat_df.index, "Close"].values.flatten()
 
     print(f"\n  Training DQN on {len(X_train)} days of history...")
     dqn = train_dqn_agent(
         X_train=X_train,
         daily_returns_train=returns_train,
+        prices_train=prices_train,
+        feature_cols=feature_cols,
         n_episodes=50,
     )
 
     # 4. Build feature row for the most recent available trading day
-    #    (build_features already dropped the last row since it has no next-day label,
-    #     so feat_df.iloc[-1] is the last complete, labelled row)
     X_today       = feat_df[feature_cols].iloc[[-1]].values
-    latest_close  = df["Close"].iloc[-1]
+    latest_close  = float(df["Close"].iloc[-1])
     latest_date   = df.index[-1].date()
 
     print(f"\n  Latest data point : {latest_date}")
-    print(f"  Last close price  : ${float(latest_close):.2f}")
+    print(f"  Last close price  : ${latest_close:.2f}")
 
-    # 5. Predict
-    pred      = int(dqn.predict(X_today)[0])
+    # 5. Predict using single-step method with cash context (no open position)
+    pred  = dqn.predict_step(
+        features=X_today[0],
+        position=0,
+        days_held=0,
+        entry_price=0.0,
+        stop_price=0.0,
+        target_price=0.0,
+        current_price=latest_close,
+    )
     action    = "BUY / HOLD" if pred == 1 else "HOLD CASH"
     arrow     = "▲" if pred == 1 else "▼"
 

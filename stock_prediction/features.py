@@ -98,6 +98,21 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     vol_ma20 = vol.rolling(20).mean()
     feat["volume_ratio"] = vol / vol_ma20                   # relative volume
 
+    # --- ATR (Average True Range) — used for dynamic stop loss placement ---
+    # True Range = max(H-L, |H-prev_C|, |L-prev_C|)
+    # ATR14 expressed as % of close so it is scale-free across tickers/time
+    prev_close  = close.shift(1)
+    tr          = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    feat["atr14_pct"] = tr.rolling(14).mean() / close      # ATR as fraction of price
+
+    # --- Relative-strength proxy: 5-day return momentum ---
+    feat["momentum5"]  = close.pct_change(5)               # 5-day return
+    feat["momentum10"] = close.pct_change(10)              # 10-day return
+
     # --- Target: 1 if tomorrow's close > today's close ---
     feat["Target"] = (close.shift(-1) > close).astype(int)
 
